@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology is the 'new linear scaling rule' for adaptive private HPO. It reduces the dimensionality of HPO by combining key hyperparameters (learning rate η and number of steps T) into a single scalar variable `r = η × T`. The method estimates optimal `r` values for small privacy budgets (ε) using random search to find two empirical points (ε1, r(ε1)) and (ε2, r(ε2)). A first-order Taylor approximation (linear interpolation) `r(ε) ≈ mε + b` is then fitted to these points to estimate `r` for any target εf. The final privacy guarantee includes the cost of HPO using f-DP accounting (PLV). The underlying training uses Differentially Private Stochastic Gradient Descent (DP-SGD) with per-sample gradient clipping (unit norm C=1), Gaussian noise addition, full-batch gradient computation, momentum (ρ=0.9), and zero-initialization of linear classifiers. The theoretical intuition is based on analyzing the excess empirical risk of private GD as a sum of non-private GD risk and divergence due to noise, upper-bounding this divergence using a 'noisy radius' related to `η × T`.
+
+# GitHub URLs List
+['https://github.com/huggingface/transfer-learning-conv-ai', 'https://github.com/lxuechen/private-transformers']
+Output:
+{
+    "index": 1
+}
