@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+FLoRA operates by leveraging meta-learning techniques and local, asynchronous HPO at each party. Each participating party independently runs an adaptive HPO scheme (e.g., Bayesian Optimization) to generate a set of (hyper-parameter, loss) pairs. These per-party sets are then collected by a central aggregator. The aggregator constructs a unified loss surface (a function mapping hyper-parameters to estimated loss) using one of four proposed aggregation methods: Single Global Model (SGM), SGM with Uncertainty (SGM+U), Maximum of Per-party Local Models (MPLM), or Average of Per-party Local Models (APLM). The optimal hyper-parameter configuration is then selected from this aggregated loss surface, and a single federated training round is performed using these recommended hyper-parameters to produce the final global model.
+
+# GitHub URLs List
+['https://github.com/rdturnermtl/bbo_challenge_starter_kit']
+Output:
+{
+    "index": 0
+}
