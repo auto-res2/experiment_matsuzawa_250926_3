@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+DyHPO employs a Gaussian Process (GP) surrogate model with a novel deep kernel. This deep kernel, `K(θ, w) := k(φ(xi, Yi,j-1, j; w), φ(xi', Yi',j'-1, j'; w); θ)`, models the similarity between hyperparameter configurations by incorporating the configuration `xi`, the budget `j`, and the learning curve `Yi,j-1`. The feature extractor `φ` consists of linear and convolutional layers: the normalized budget `j` is concatenated with `xi` and fed into a linear layer, while the learning curve `Yi,j-1` is processed by a one-dimensional convolution followed by global max pooling; both representations are then combined by another linear layer. The parameters of the kernel (`θ` and `w`) are optimized via maximum likelihood estimation using gradient descent and Adam. For selecting the next configuration, DyHPO utilizes a multi-fidelity Expected Improvement (EIMF) acquisition function, `EIMF(x, j|D) = E[max{f(x, j) - ymax_j, 0}]`, which considers the best observed performance for a given budget `j` or across all budgets. The algorithm dynamically decides which candidate configuration to train for a small additional budget, slowly increasing the budget for promising configurations in a 'dynamic race' approach.
+
+# GitHub URLs List
+['https://github.com/releaunifreiburg/DyHPO', 'https://github.com/automl/LCBench', 'https://github.com/google-research/google-research', 'https://github.com/D-X-Y/NAS-Bench-201', 'https://github.com/automl/HpBandSter', 'https://github.com/automl/DEHB', 'https://github.com/dragonfly/dragonfly', 'https://github.com/shib0li/DNN-MFBO']
+Output:
+{
+    "index": 0
+}
