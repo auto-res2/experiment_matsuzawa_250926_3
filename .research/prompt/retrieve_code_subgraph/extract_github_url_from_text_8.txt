@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology involves leveraging Multilevel Monte Carlo (MLMC) to efficiently approximate analytically intractable look-ahead acquisition functions in BO. Multi-step acquisition functions are formulated as Markov Decision Processes (MDPs) and optimized using nested Sample Average Approximation (SAA) and Monte Carlo (MC) estimations. MLMC works by constructing a telescoping sum of estimators with increasing accuracy and cost across levels (e.g., Ml = 2^l samples), performing most simulations with low accuracy/cost and fewer with high accuracy/cost. The error of SAA with nested MC is decomposed into "variance" and "bias" terms, allowing MLMC application. Two MLMC formulations are discussed: a multilevel estimator for the maximizer (x*ML) and an MLMC approximation of the acquisition function (αML(x)). An antithetic coupling approach is introduced for the maximizer estimator to further improve convergence rates, potentially achieving canonical O(ε^-2) complexity. Gaussian Processes (GPs) are used as surrogate models for the black-box functions.
+
+# GitHub URLs List
+['https://github.com/Shangda-Yang/MLMCBO']
+Output:
+{
+    "index": 0
+}
