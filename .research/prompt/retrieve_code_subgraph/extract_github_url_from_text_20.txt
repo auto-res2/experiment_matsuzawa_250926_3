@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The methodology formalizes federated hyperparameter optimization, distinguishing between global and personalized objectives. Baselines are established by adapting standard non-federated algorithms like Random Search (RS) and Successive Halving (SHA) for the federated setting, using a single round's validation data as a noisy surrogate. The core of the method is FedEx, which employs a stochastic relaxation of the hyperparameter tuning problem, viewing it as a single-level empirical risk minimization. It alternates standard SGD updates for model weights with exponentiated gradient updates for hyperparameter distribution parameters (θ), often using a categorical distribution over a set of sampled configurations. FedEx integrates a local perturbation scheme for selecting initial configurations to enhance stability. For theoretical analysis, the ARUBA framework is used to prove guarantees for tuning the client step-size in an online convex optimization setting using bandit exponentiated gradient.
+
+# GitHub URLs List
+['https://github.com/mkhodak/fedex', 'https://github.com/TalwalkarLab/leaf']
+Output:
+{
+    "index": 0
+}
