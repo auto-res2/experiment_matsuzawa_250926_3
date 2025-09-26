@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+FEDHPO-B is built upon the FederatedScope (FS) FL platform and offers three evaluation modes: 'tabular', 'surrogate', and 'raw'. The 'tabular' mode provides pre-computed results from grid searches over discrete hyperparameter spaces, stored in lookup tables. The 'surrogate' mode uses random forest models, trained on the tabular data, to enable efficient inference for arbitrary hyperparameter configurations. The 'raw' mode allows for true execution of FL algorithms in containerized environments for user-defined search spaces. A novel system model is implemented to estimate realistic execution times in the 'raw' mode, considering communication bottlenecks (server, client bandwidth) and client computational heterogeneity (modeled with exponential distribution for straggler estimation). For integrating FedHPO methods, a general algorithmic view unifying several approaches (e.g., FedEx, FTS) is proposed, facilitating extensibility. The benchmark evaluated traditional HPO methods (Random Search, Differential Evolution, Bayesian Optimization with GP, RF, KDE) and multi-fidelity optimizers (Hyperband, BOHB, DEHB, TPE with median stopping/Hyperband) on various FL tasks.
+
+# GitHub URLs List
+['https://github.com/alibaba/FederatedScope', 'https://github.com/automl/DEHB']
+Output:
+{
+    "index": 0
+}
