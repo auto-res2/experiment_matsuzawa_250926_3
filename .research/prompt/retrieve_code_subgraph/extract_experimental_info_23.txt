@@ -1,0 +1,1270 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+FLoRA leverages meta-learning techniques by utilizing local and asynchronous HPO at each party. Each party independently performs HPO (e.g., Bayesian Optimization) to generate a set of (hyper-parameter, local loss) pairs. These pairs are then collected by a central aggregator, which constructs a unified loss surface across the entire hyper-parameter space. Four distinct methods are proposed for constructing this unified loss surface: Single Global Model (SGM), SGM with Uncertainty (SGM+U), Maximum of Per-Party Local Models (MPLM), and Average of Per-Party Local Models (APLM). The aggregator then selects the optimal hyper-parameter configuration from this surface, which is subsequently used for a single round of federated training.
+
+# Repository Content
+File Path: example_submissions/hyperopt/optimizer.py
+Content:
+import numpy as np
+from hyperopt import hp, tpe
+from hyperopt.base import JOB_STATE_DONE, JOB_STATE_NEW, STATUS_OK, Domain, Trials
+from scipy.interpolate import interp1d
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+from bayesmark.np_util import random as np_random
+from bayesmark.np_util import random_seed
+
+# Sklearn prefers str to unicode:
+DTYPE_MAP = {"real": float, "int": int, "bool": bool, "cat": str, "ordinal": str}
+
+
+def dummy_f(x):
+    assert False, "This is a placeholder, it should never be called."
+
+
+def only(x):
+    y, = x
+    return y
+
+
+class HyperoptOptimizer(AbstractOptimizer):
+    primary_import = "hyperopt"
+
+    def __init__(self, api_config, random=np_random):
+        """Build wrapper class to use hyperopt optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+        self.random = random
+
+        space, self.round_to_values = HyperoptOptimizer.get_hyperopt_dimensions(api_config)
+        self.domain = Domain(dummy_f, space, pass_expr_memo_ctrl=None)
+        self.trials = Trials()
+
+        # Some book keeping like opentuner wrapper
+        self.trial_id_lookup = {}
+
+        # Store just for data validation
+        self.param_set_chk = frozenset(api_config.keys())
+
+    @staticmethod
+    def hashable_dict(d):
+        """A custom function for hashing dictionaries.
+
+        Parameters
+        ----------
+        d : dict or dict-like
+            The dictionary to be converted to immutable/hashable type.
+
+        Returns
+        -------
+        hashable_object : frozenset of tuple pairs
+            Bijective equivalent to dict that can be hashed.
+        """
+        hashable_object = frozenset(d.items())
+        return hashable_object
+
+    @staticmethod
+    def get_hyperopt_dimensions(api_config):
+        """Help routine to setup hyperopt search space in constructor.
+
+        Take api_config as argument so this can be static.
+        """
+        # The ordering of iteration prob makes no difference, but just to be
+        # safe and consistnent with space.py, I will make sorted.
+        param_list = sorted(api_config.keys())
+
+        space = {}
+        round_to_values = {}
+        for param_name in param_list:
+            param_config = api_config[param_name]
+
+            param_type = param_config["type"]
+
+            param_space = param_config.get("space", None)
+            param_range = param_config.get("range", None)
+            param_values = param_config.get("values", None)
+
+            # Some setup for case that whitelist of values is provided:
+            values_only_type = param_type in ("cat", "ordinal")
+            if (param_values is not None) and (not values_only_type):
+                assert param_range is None
+                param_values = np.unique(param_values)
+                param_range = (param_values[0], param_values[-1])
+                round_to_values[param_name] = interp1d(
+                    param_values, param_values, kind="nearest", fill_value="extrapolate"
+                )
+
+            if param_type == "int":
+                low, high = param_range
+                if param_space in ("log", "logit"):
+                    space[param_name] = hp.qloguniform(param_name, np.log(low), np.log(high), 1)
+                else:
+                    space[param_name] = hp.quniform(param_name, low, high, 1)
+            elif param_type == "bool":
+                assert param_range is None
+                assert param_values is None
+                space[param_name] = hp.choice(param_name, (False, True))
+            elif param_type in ("cat", "ordinal"):
+                assert param_range is None
+                space[param_name] = hp.choice(param_name, param_values)
+            elif param_type == "real":
+                low, high = param_range
+                if param_space in ("log", "logit"):
+                    space[param_name] = hp.loguniform(param_name, np.log(low), np.log(high))
+                else:
+                    space[param_name] = hp.uniform(param_name, low, high)
+            else:
+                assert False, "type %s not handled in API" % param_type
+
+        return space, round_to_values
+
+    def get_trial(self, trial_id):
+        for trial in self.trials._dynamic_trials:
+            if trial["tid"] == trial_id:
+                assert isinstance(trial, dict)
+                # Make sure right kind of dict
+                assert "state" in trial and "result" in trial
+                assert trial["state"] == JOB_STATE_NEW
+                return trial
+        assert False, "No matching trial ID"
+
+    def cleanup_guess(self, x_guess):
+        assert isinstance(x_guess, dict)
+        # Also, check the keys are only the vars we are searching over:
+        assert frozenset(x_guess.keys()) == self.param_set_chk
+
+        # Do the rounding
+        # Make a copy to be safe, and also unpack singletons
+        # We may also need to consider clip_chk at some point like opentuner
+        x_guess = {k: only(x_guess[k]) for k in x_guess}
+        for param_name, round_f in self.round_to_values.items():
+            x_guess[param_name] = round_f(x_guess[param_name])
+        # Also ensure this is correct dtype so sklearn is happy
+        x_guess = {k: DTYPE_MAP[self.api_config[k]["type"]](x_guess[k]) for k in x_guess}
+        return x_guess
+
+    def _suggest(self):
+        """Helper function to `suggest` that does the work of calling
+        `hyperopt` via its dumb API.
+        """
+        new_ids = self.trials.new_trial_ids(1)
+        assert len(new_ids) == 1
+        self.trials.refresh()
+
+        seed = random_seed(self.random)
+        new_trials = tpe.suggest(new_ids, self.domain, self.trials, seed)
+        assert len(new_trials) == 1
+
+        self.trials.insert_trial_docs(new_trials)
+        self.trials.refresh()
+
+        new_trial, = new_trials  # extract singleton
+        return new_trial
+
+    def suggest(self, n_suggestions=1):
+        """Make `n_suggestions` suggestions for what to evaluate next.
+
+        This requires the user observe all previous suggestions before calling
+        again.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            The number of suggestions to return.
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+        assert n_suggestions >= 1, "invalid value for n_suggestions"
+
+        # Get the new trials, it seems hyperopt either uses random search or
+        # guesses one at a time anyway, so we might as welll call serially.
+        new_trials = [self._suggest() for _ in range(n_suggestions)]
+
+        X = []
+        for trial in new_trials:
+            x_guess = self.cleanup_guess(trial["misc"]["vals"])
+            X.append(x_guess)
+
+            # Build lookup to get original trial object
+            x_guess_ = HyperoptOptimizer.hashable_dict(x_guess)
+            assert x_guess_ not in self.trial_id_lookup, "the suggestions should not already be in the trial dict"
+            self.trial_id_lookup[x_guess_] = trial["tid"]
+
+        assert len(X) == n_suggestions
+        return X
+
+    def observe(self, X, y):
+        """Feed the observations back to hyperopt.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated.
+        """
+        assert len(X) == len(y)
+
+        for x_guess, y_ in zip(X, y):
+            x_guess_ = HyperoptOptimizer.hashable_dict(x_guess)
+            assert x_guess_ in self.trial_id_lookup, "Appears to be guess that did not originate from suggest"
+
+            assert x_guess_ in self.trial_id_lookup, "trial object not available in trial dict"
+            trial_id = self.trial_id_lookup.pop(x_guess_)
+            trial = self.get_trial(trial_id)
+            assert self.cleanup_guess(trial["misc"]["vals"]) == x_guess, "trial ID not consistent with x values stored"
+
+            # Cast to float to ensure native type
+            result = {"loss": float(y_), "status": STATUS_OK}
+            trial["state"] = JOB_STATE_DONE
+            trial["result"] = result
+        # hyperopt.fmin.FMinIter.serial_evaluate only does one refresh at end
+        # of loop of a bunch of evals, so we will do the same thing here.
+        self.trials.refresh()
+
+
+if __name__ == "__main__":
+    experiment_main(HyperoptOptimizer)
+
+File Path: example_submissions/nevergrad/optimizer.py
+Content:
+import nevergrad.optimization as optimization
+import numpy as np
+from nevergrad import instrumentation as inst
+from scipy.stats import norm
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+from bayesmark.np_util import linear_rescale
+from bayesmark.space import Real
+
+
+class NevergradOptimizer(AbstractOptimizer):
+    primary_import = "nevergrad"
+
+    def __init__(self, api_config, tool="OnePlusOne", budget=300):
+        """Build wrapper class to use nevergrad optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        budget : int
+            Expected number of max function evals
+        """
+        AbstractOptimizer.__init__(self, api_config)
+
+        self.instrum, self.space = NevergradOptimizer.get_nvg_dimensions(api_config)
+
+        dimension = self.instrum.dimension
+        opt_class = optimization.registry[tool]
+        self.optim = opt_class(dimension=dimension, budget=budget)
+
+    @staticmethod
+    def get_nvg_dimensions(api_config):
+        """Help routine to setup nevergrad search space in constructor.
+
+        Take api_config as argument so this can be static.
+        """
+        # The ordering of iteration prob makes no difference, but just to be
+        # safe and consistnent with space.py, I will make sorted.
+        param_list = sorted(api_config.keys())
+
+        all_args = {}
+        all_prewarp = {}
+        for param_name in param_list:
+            param_config = api_config[param_name]
+
+            param_type = param_config["type"]
+
+            param_space = param_config.get("space", None)
+            param_range = param_config.get("range", None)
+            param_values = param_config.get("values", None)
+
+            prewarp = None
+            if param_type == "cat":
+                assert param_space is None
+                assert param_range is None
+                arg = inst.var.SoftmaxCategorical(param_values)
+            elif param_type == "bool":
+                assert param_space is None
+                assert param_range is None
+                assert param_values is None
+                arg = inst.var.OrderedDiscrete([False, True])
+            elif param_values is not None:
+                assert param_type in ("int", "ordinal", "real")
+                arg = inst.var.OrderedDiscrete(param_values)
+                # We are throwing away information here, but OrderedDiscrete
+                # appears to be invariant to monotonic transformation anyway.
+            elif param_type == "int":
+                assert param_values is None
+                # Need +1 since API in inclusive
+                choices = range(int(param_range[0]), int(param_range[-1]) + 1)
+                arg = inst.var.OrderedDiscrete(choices)
+                # We are throwing away information here, but OrderedDiscrete
+                # appears to be invariant to monotonic transformation anyway.
+            elif param_type == "real":
+                assert param_values is None
+                assert param_range is not None
+                # Will need to warp to this space sep.
+                arg = inst.var.Gaussian(mean=0, std=1)
+                prewarp = Real(warp=param_space, range_=param_range)
+            else:
+                assert False, "type %s not handled in API" % param_type
+
+            all_args[param_name] = arg
+            all_prewarp[param_name] = prewarp
+        instrum = inst.Instrumentation(**all_args)
+        return instrum, all_prewarp
+
+    def prewarp(self, xx):
+        """Extra work needed to get variables into the Gaussian space
+        representation."""
+        xxw = {}
+        for arg_name, vv in xx.items():
+            assert np.isscalar(vv)
+            space = self.space[arg_name]
+
+            if space is not None:
+                # Warp so we think it is apriori uniform in [a, b]
+                vv = space.warp(vv)
+                assert vv.size == 1
+
+                # Now make uniform on [0, 1], also unpack warped to scalar
+                (lb, ub), = space.get_bounds()
+                vv = linear_rescale(vv.item(), lb, ub, 0, 1)
+
+                # Now make std Gaussian apriori
+                vv = norm.ppf(vv)
+            assert np.isscalar(vv)
+            xxw[arg_name] = vv
+        return xxw
+
+    def postwarp(self, xxw):
+        """Extra work needed to undo the Gaussian space representation."""
+        xx = {}
+        for arg_name, vv in xxw.items():
+            assert np.isscalar(vv)
+            space = self.space[arg_name]
+
+            if space is not None:
+                # Now make std Gaussian apriori
+                vv = norm.cdf(vv)
+
+                # Now make uniform on [0, 1]
+                (lb, ub), = space.get_bounds()
+                vv = linear_rescale(vv, 0, 1, lb, ub)
+
+                # Warp so we think it is apriori uniform in [a, b]
+                vv = space.unwarp([vv])
+            assert np.isscalar(vv)
+            xx[arg_name] = vv
+        return xx
+
+    def suggest(self, n_suggestions=1):
+        """Get suggestion from nevergrad.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            Desired number of parallel suggestions in the output
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+        x_guess_data = [self.optim.ask() for _ in range(n_suggestions)]
+
+        x_guess = [None] * n_suggestions
+        for ii, xx in enumerate(x_guess_data):
+            x_pos, x_kwarg = self.instrum.data_to_arguments(xx)
+            assert x_pos == ()
+            x_guess[ii] = self.postwarp(x_kwarg)
+
+        return x_guess
+
+    def observe(self, X, y):
+        """Feed an observation back to nevergrad.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated
+        """
+        for xx, yy in zip(X, y):
+            xx = self.prewarp(xx)
+            xx = self.instrum.arguments_to_data(**xx)
+            self.optim.tell(xx, yy)
+
+
+if __name__ == "__main__":
+    experiment_main(NevergradOptimizer)
+
+File Path: example_submissions/opentuner/optimizer.py
+Content:
+"""
+In opentuner, many search techniques are already available. All the names of
+the techniques can be found as follows:
+```
+>>> import opentuner
+>>> techniques, generators = opentuner.search.technique.all_techniques()
+>>> for t in techniques:
+...     print t.name
+```
+A user can also create new search techniques
+(http://opentuner.org/tutorial/techniques/).
+
+Opentuner will create a multi-arm bandit of multiple techniques if more than
+one technique is specified in `args.technique`.
+
+Some bandits with pre-defined techniques are already registered in:
+`opentuner.search.bandittechniques`
+
+By default, we use a pre-defined bandit called `'AUCBanditMetaTechniqueA'` of 4
+techniques:
+```
+register(AUCBanditMetaTechnique([
+        differentialevolution.DifferentialEvolutionAlt(),
+        evolutionarytechniques.UniformGreedyMutation(),
+        evolutionarytechniques.NormalGreedyMutation(mutation_rate=0.3),
+        simplextechniques.RandomNelderMead()],
+        name='AUCBanditMetaTechniqueA'))
+```
+The other two bandits used in our experiments are: PSO_GA_DE and PSO_GA_Bandit.
+Specifying a list of multiple techniques will use a multi-arm bandit over them.
+"""
+import warnings
+from argparse import Namespace
+
+import opentuner.tuningrunmain
+from opentuner.api import TuningRunManager
+from opentuner.measurement.interface import DefaultMeasurementInterface as DMI
+from opentuner.resultsdb.models import DesiredResult, Result
+from opentuner.search.manipulator import (
+    ConfigurationManipulator,
+    EnumParameter,
+    FloatParameter,
+    IntegerParameter,
+    LogFloatParameter,
+    LogIntegerParameter,
+    ScaledNumericParameter,
+)
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+from bayesmark.np_util import clip_chk
+
+DEFAULT_TECHNIQUES = ("AUCBanditMetaTechniqueA",)
+MEMORY_ONLY_DB = "sqlite://"
+
+# Monkey patch here! Opentuner is messed up, TuningRunMain changes global log
+# settings. We should file in issue report here and have them fix it.
+opentuner.tuningrunmain.init_logging = lambda: None
+
+
+def ClippedParam(cls, epsilon=1e-5):
+    """Build wrapper class of opentuner parameter class that use clip check to
+    keep parameters in the allowed range despite numerical errors.
+
+    Class built on `ScaledNumericParameter` abstract class defined in:
+    `opentuner.search.manipulator.ScaledNumericParameter`.
+
+    Parameters
+    ----------
+    cls : ScaledNumericParameter
+        Opentuner parameter class, such as `LogFloatParameter` or
+        `FloatParameter`, which transforms the domain of parameter.
+
+    Returns
+    -------
+    StableClass : ScaledNumericParameter
+        New class equivalent to original `cls` but it overwrites the orginal
+        `_unscale` method to enforce a clip check to keep the parameters within
+        their allowed range.
+    """
+    assert issubclass(
+        cls, ScaledNumericParameter
+    ), "this class cls should inherit from the ScaledNumericParameter class"
+
+    class StableClass(cls):
+        def _unscale(self, v):
+            unscaled_v = super(StableClass, self)._unscale(v)
+            unscaled_v = clip_chk(unscaled_v, self.min_value, self.max_value)
+            return unscaled_v
+
+    return StableClass
+
+
+class OpentunerOptimizer(AbstractOptimizer):
+    primary_import = "opentuner"
+
+    def __init__(self, api_config, techniques=DEFAULT_TECHNIQUES, n_suggestions=1):
+        """Build wrapper class to use opentuner optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+
+        techniques : iterable of strings
+            A list or tuple of techniques to use in opentuner. If the list
+            has only one technique, then that technique will be used. If the
+            list has multiple techniques a bandit over those techniques
+            will be used.
+
+        n_suggestions : int
+            Default number of suggestions to be made in parallel.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+
+        # Opentuner requires DesiredResult to reference suggestion when making
+        # its observation. x_to_dr maps the dict suggestion to DesiredResult.
+        self.x_to_dr = {}
+        # Keep last suggested x and repeat it whenever opentuner gives up.
+        self.dummy_suggest = None
+
+        """Setting up the arguments for opentuner. You can see all possible
+        arguments using:
+        ```
+        >>> import opentuner
+        >>> opentuner.default_argparser().parse_args(['-h'])
+        ```
+        We only change a few arguments (other arguments are set to defaults):
+        * database = MEMORY_ONLY_DB: to use an in-memory sqlite database
+        * parallelism = n_suggestions: num of suggestions to give in parallel
+        * technique = techniques: a list of techniques to be used by opentuner
+        * print_params = False: to avoid opentuner from exiting after printing
+            param spaces
+        """
+        args = Namespace(
+            bail_threshold=500,
+            database=MEMORY_ONLY_DB,
+            display_frequency=10,
+            generate_bandit_technique=False,
+            label=None,
+            list_techniques=False,
+            machine_class=None,
+            no_dups=False,
+            parallel_compile=False,
+            parallelism=n_suggestions,
+            pipelining=0,
+            print_params=False,
+            print_search_space_size=False,
+            quiet=False,
+            results_log=None,
+            results_log_details=None,
+            seed_configuration=[],
+            stop_after=None,
+            technique=techniques,
+            test_limit=5000,
+        )
+
+        # Setup some dummy classes required by opentuner to actually run.
+        manipulator = OpentunerOptimizer.build_manipulator(api_config)
+        interface = DMI(args=args, manipulator=manipulator)
+        self.api = TuningRunManager(interface, args)
+
+    @staticmethod
+    def hashable_dict(d):
+        """A custom function for hashing dictionaries.
+
+        Parameters
+        ----------
+        d : dict or dict-like
+            The dictionary to be converted to immutable/hashable type.
+
+        Returns
+        -------
+        hashable_object : frozenset of tuple pairs
+            Bijective equivalent to dict that can be hashed.
+        """
+        hashable_object = frozenset(d.items())
+        return hashable_object
+
+    @staticmethod
+    def build_manipulator(api_config):
+        """Build a ConfigurationManipulator object to be used by opentuner.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+
+        Returns
+        -------
+        manipulator : ConfigurationManipulator
+            Some over complexified class required by opentuner to run.
+        """
+        manipulator = ConfigurationManipulator()
+
+        for pname in api_config:
+            ptype = api_config[pname]["type"]
+            pspace = api_config[pname].get("space", None)
+            pmin, pmax = api_config[pname].get("range", (None, None))
+
+            if ptype == "real":
+                if pspace in ("linear", "logit"):
+                    ot_param = FloatParameter(pname, pmin, pmax)
+                elif pspace in ("log", "bilog"):
+                    LogFloatParameter_ = ClippedParam(LogFloatParameter)
+                    ot_param = LogFloatParameter_(pname, pmin, pmax)
+                else:
+                    assert False, "unsupported param space = %s" % pspace
+            elif ptype == "int":
+                if pspace in ("linear", "logit"):
+                    ot_param = IntegerParameter(pname, pmin, pmax)
+                elif pspace in ("log", "bilog"):
+                    ot_param = LogIntegerParameter(pname, pmin, pmax)
+                else:
+                    assert False, "unsupported param space = %s" % pspace
+            elif ptype == "bool":
+                # The actual bool parameter seems not to work in Py3 :(
+                ot_param = IntegerParameter(pname, 0, 1)
+            elif ptype in ("cat", "ordinal"):
+                # Treat ordinal and categorical variables the same for now.
+                assert "values" in api_config[pname]
+                pvalues = api_config[pname]["values"]
+                ot_param = EnumParameter(pname, pvalues)
+            else:
+                assert False, "type=%s/space=%s not handled in opentuner yet" % (ptype, pspace)
+            manipulator.add_parameter(ot_param)
+        return manipulator
+
+    def suggest(self, n_suggestions=1):
+        """Make `n_suggestions` suggestions for what to evaluate next.
+
+        This requires the user observe all previous suggestions before calling
+        again.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            The number of suggestions to return.
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+        assert n_suggestions >= 1, "invalid value for n_suggestions"
+
+        # Update the n_suggestions if it is different from the current setting.
+        if self.api.search_driver.args.parallelism != n_suggestions:
+            self.api.search_driver.args.parallelism = n_suggestions
+            warnings.warn("n_suggestions changed across suggest calls")
+
+        # Require the user to already observe all previous suggestions.
+        # Otherwise, opentuner will just recycle old suggestions.
+        assert len(self.x_to_dr) == 0, "all the previous suggestions should have been observed by now"
+
+        # The real meat of suggest from opentuner: Get next `n_suggestions`
+        # unique suggestions.
+        desired_results = [self.api.get_next_desired_result() for _ in range(n_suggestions)]
+
+        # Save DesiredResult object in dict since observe will need it.
+        X = []
+        using_dummy_suggest = False
+        for ii in range(n_suggestions):
+            # Opentuner can give up, but the API requires guessing forever.
+            if desired_results[ii] is None:
+                assert self.dummy_suggest is not None, "opentuner gave up on the first call!"
+                # Use the dummy suggestion in this case.
+                X.append(self.dummy_suggest)
+                using_dummy_suggest = True
+                continue
+
+            # Get the simple dict equivalent to suggestion.
+            x_guess = desired_results[ii].configuration.data
+            X.append(x_guess)
+
+            # Now save the desired result for future use in observe.
+            x_guess_ = OpentunerOptimizer.hashable_dict(x_guess)
+            assert x_guess_ not in self.x_to_dr, "the suggestions should not already be in the x_to_dr dict"
+            self.x_to_dr[x_guess_] = desired_results[ii]
+            # This will also catch None from opentuner.
+            assert isinstance(self.x_to_dr[x_guess_], DesiredResult)
+
+        assert len(X) == n_suggestions, "incorrect number of suggestions provided by opentuner"
+        # Log suggestion for repeating if opentuner gives up next time. We can
+        # only do this when it is not already being used since it we will be
+        # checking guesses against dummy_suggest in observe.
+        if not using_dummy_suggest:
+            self.dummy_suggest = X[-1]
+        return X
+
+    def observe(self, X, y):
+        """Feed the observations back to opentuner.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated.
+        """
+        assert len(X) == len(y)
+
+        for x_guess, y_ in zip(X, y):
+            x_guess_ = OpentunerOptimizer.hashable_dict(x_guess)
+
+            # If we can't find the dr object then it must be the dummy guess.
+            if x_guess_ not in self.x_to_dr:
+                assert x_guess == self.dummy_suggest, "Appears to be guess that did not originate from suggest"
+                continue
+
+            # Get the corresponding DesiredResult object.
+            dr = self.x_to_dr.pop(x_guess_, None)
+            # This will also catch None from opentuner.
+            assert isinstance(dr, DesiredResult), "DesiredResult object not available in x_to_dr"
+
+            # Opentuner's arg names assume we are minimizing execution time.
+            # So, if we want to minimize we have to pretend y is a 'time'.
+            result = Result(time=y_)
+            self.api.report_result(dr, result)
+
+
+if __name__ == "__main__":
+    experiment_main(OpentunerOptimizer)
+
+File Path: example_submissions/pysot/optimizer.py
+Content:
+import warnings
+from copy import copy
+
+import numpy as np
+from poap.strategy import EvalRecord
+from pySOT.experimental_design import SymmetricLatinHypercube
+from pySOT.optimization_problems import OptimizationProblem
+from pySOT.strategy import SRBFStrategy
+from pySOT.surrogate import CubicKernel, LinearTail, RBFInterpolant, SurrogateUnitBox
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+from bayesmark.space import JointSpace
+
+
+class PySOTOptimizer(AbstractOptimizer):
+    primary_import = "pysot"
+
+    def __init__(self, api_config):
+        """Build wrapper class to use an optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+
+        self.space_x = JointSpace(api_config)
+        self.bounds = self.space_x.get_bounds()
+        self.create_opt_prob()  # Sets up the optimization problem (needs self.bounds)
+        self.max_evals = np.iinfo(np.int32).max  # NOTE: Largest possible int
+        self.batch_size = None
+        self.history = []
+        self.proposals = []
+
+    def create_opt_prob(self):
+        """Create an optimization problem object."""
+        opt = OptimizationProblem()
+        opt.lb = self.bounds[:, 0]  # In warped space
+        opt.ub = self.bounds[:, 1]  # In warped space
+        opt.dim = len(self.bounds)
+        opt.cont_var = np.arange(len(self.bounds))
+        opt.int_var = []
+        assert len(opt.cont_var) + len(opt.int_var) == opt.dim
+        opt.objfun = None
+        self.opt = opt
+
+    def start(self, max_evals):
+        """Starts a new pySOT run."""
+        self.history = []
+        self.proposals = []
+
+        # Symmetric Latin hypercube design
+        des_pts = max([self.batch_size, 2 * (self.opt.dim + 1)])
+        slhd = SymmetricLatinHypercube(dim=self.opt.dim, num_pts=des_pts)
+
+        # Warped RBF interpolant
+        rbf = RBFInterpolant(dim=self.opt.dim, kernel=CubicKernel(), tail=LinearTail(self.opt.dim), eta=1e-4)
+        rbf = SurrogateUnitBox(rbf, lb=self.opt.lb, ub=self.opt.ub)
+
+        # Optimization strategy
+        self.strategy = SRBFStrategy(
+            max_evals=self.max_evals,
+            opt_prob=self.opt,
+            exp_design=slhd,
+            surrogate=rbf,
+            asynchronous=True,
+            batch_size=1,
+            use_restarts=True,
+        )
+
+    def suggest(self, n_suggestions=1):
+        """Get a suggestion from the optimizer.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            Desired number of parallel suggestions in the output
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+
+        if self.batch_size is None:  # First call to suggest
+            self.batch_size = n_suggestions
+            self.start(self.max_evals)
+
+        # Set the tolerances pretending like we are running batch
+        d, p = float(self.opt.dim), float(n_suggestions)
+        self.strategy.failtol = p * int(max(np.ceil(d / p), np.ceil(4 / p)))
+
+        # Now we can make suggestions
+        x_w = []
+        self.proposals = []
+        for _ in range(n_suggestions):
+            proposal = self.strategy.propose_action()
+            record = EvalRecord(proposal.args, status="pending")
+            proposal.record = record
+            proposal.accept()  # This triggers all the callbacks
+
+            # It is possible that pySOT proposes a previously evaluated point
+            # when all variables are integers, so we just abort in this case
+            # since we have likely converged anyway. See PySOT issue #30.
+            x = list(proposal.record.params)  # From tuple to list
+            x_unwarped, = self.space_x.unwarp(x)
+            if x_unwarped in self.history:
+                warnings.warn("pySOT proposed the same point twice")
+                self.start(self.max_evals)
+                return self.suggest(n_suggestions=n_suggestions)
+
+            # NOTE: Append unwarped to avoid rounding issues
+            self.history.append(copy(x_unwarped))
+            self.proposals.append(proposal)
+            x_w.append(copy(x_unwarped))
+
+        return x_w
+
+    def _observe(self, x, y):
+        # Find the matching proposal and execute its callbacks
+        idx = [x == xx for xx in self.history]
+        i = np.argwhere(idx)[0].item()  # Pick the first index if there are ties
+        proposal = self.proposals[i]
+        proposal.record.complete(y)
+        self.proposals.pop(i)
+        self.history.pop(i)
+
+    def observe(self, X, y):
+        """Send an observation of a suggestion back to the optimizer.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated
+        """
+        assert len(X) == len(y)
+
+        for x_, y_ in zip(X, y):
+            # Just ignore, any inf observations we got, unclear if right thing
+            if np.isfinite(y_):
+                self._observe(x_, y_)
+
+
+if __name__ == "__main__":
+    experiment_main(PySOTOptimizer)
+
+File Path: example_submissions/random-search/optimizer.py
+Content:
+import bayesmark.random_search as rs
+from bayesmark import np_util
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+
+
+class RandomOptimizer(AbstractOptimizer):
+    # Unclear what is best package to list for primary_import here.
+    primary_import = "bayesmark"
+
+    def __init__(self, api_config, random=np_util.random):
+        """Build wrapper class to use random search function in benchmark.
+
+        Settings for `suggest_dict` can be passed using kwargs.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+        self.random = random
+
+    def suggest(self, n_suggestions=1):
+        """Get suggestion.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            Desired number of parallel suggestions in the output
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+        x_guess = rs.suggest_dict([], [], self.api_config, n_suggestions=n_suggestions, random=self.random)
+        return x_guess
+
+    def observe(self, X, y):
+        """Feed an observation back.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated
+        """
+        # Random search so don't do anything
+        pass
+
+
+if __name__ == "__main__":
+    experiment_main(RandomOptimizer)
+
+File Path: example_submissions/skopt/optimizer.py
+Content:
+import numpy as np
+from scipy.interpolate import interp1d
+from skopt import Optimizer as SkOpt
+from skopt.space import Categorical, Integer, Real
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+
+
+class ScikitOptimizer(AbstractOptimizer):
+    primary_import = "scikit-optimize"
+
+    def __init__(self, api_config, base_estimator="GBRT", acq_func="EI", n_initial_points=5):
+        """Build wrapper class to use an optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        base_estimator : {'GP', 'RF', 'ET', 'GBRT'}
+            How to estimate the objective function.
+        acq_func : {'LCB', 'EI', 'PI', 'gp_hedge', 'EIps', 'PIps'}
+            Acquisition objective to decide next suggestion.
+        n_initial_points : int
+            Number of points to sample randomly before actual Bayes opt.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+
+        dimensions, self.round_to_values = ScikitOptimizer.get_sk_dimensions(api_config)
+
+        # Older versions of skopt don't copy over the dimensions names during
+        # normalization and hence the names are missing in
+        # self.skopt.space.dimensions. Therefore, we save our own copy of
+        # dimensions list to be safe. If we can commit to using the newer
+        # versions of skopt we can delete self.dimensions.
+        self.dimensions_list = tuple(dd.name for dd in dimensions)
+
+        self.skopt = SkOpt(
+            dimensions,
+            n_initial_points=n_initial_points,
+            base_estimator=base_estimator,
+            acq_func=acq_func,
+            acq_optimizer="sampling",
+            acq_func_kwargs={},
+            acq_optimizer_kwargs={},
+        )
+
+    @staticmethod
+    def get_sk_dimensions(api_config, transform="normalize"):
+        """Help routine to setup skopt search space in constructor.
+
+        Take api_config as argument so this can be static.
+        """
+        # The ordering of iteration prob makes no difference, but just to be
+        # safe and consistnent with space.py, I will make sorted.
+        param_list = sorted(api_config.keys())
+
+        sk_dims = []
+        round_to_values = {}
+        for param_name in param_list:
+            param_config = api_config[param_name]
+
+            param_type = param_config["type"]
+
+            param_space = param_config.get("space", None)
+            param_range = param_config.get("range", None)
+            param_values = param_config.get("values", None)
+
+            # Some setup for case that whitelist of values is provided:
+            values_only_type = param_type in ("cat", "ordinal")
+            if (param_values is not None) and (not values_only_type):
+                assert param_range is None
+                param_values = np.unique(param_values)
+                param_range = (param_values[0], param_values[-1])
+                round_to_values[param_name] = interp1d(
+                    param_values, param_values, kind="nearest", fill_value="extrapolate"
+                )
+
+            if param_type == "int":
+                # Integer space in sklearn does not support any warping => Need
+                # to leave the warping as linear in skopt.
+                sk_dims.append(Integer(param_range[0], param_range[-1], transform=transform, name=param_name))
+            elif param_type == "bool":
+                assert param_range is None
+                assert param_values is None
+                sk_dims.append(Integer(0, 1, transform=transform, name=param_name))
+            elif param_type in ("cat", "ordinal"):
+                assert param_range is None
+                # Leave x-form to one-hot as per skopt default
+                sk_dims.append(Categorical(param_values, name=param_name))
+            elif param_type == "real":
+                # Skopt doesn't support all our warpings, so need to pick
+                # closest substitute it does support.
+                prior = "log-uniform" if param_space in ("log", "logit") else "uniform"
+                sk_dims.append(Real(param_range[0], param_range[-1], prior=prior, transform=transform, name=param_name))
+            else:
+                assert False, "type %s not handled in API" % param_type
+        return sk_dims, round_to_values
+
+    def suggest(self, n_suggestions=1):
+        """Get a suggestion from the optimizer.
+
+        Parameters
+        ----------
+        n_suggestions : int
+            Desired number of parallel suggestions in the output
+
+        Returns
+        -------
+        next_guess : list of dict
+            List of `n_suggestions` suggestions to evaluate the objective
+            function. Each suggestion is a dictionary where each key
+            corresponds to a parameter being optimized.
+        """
+        # First get list of lists from skopt.ask()
+        next_guess = self.skopt.ask(n_points=n_suggestions)
+        # Then convert to list of dicts
+        next_guess = [dict(zip(self.dimensions_list, x)) for x in next_guess]
+
+        # Now do the rounding, custom rounding is not supported in skopt. Note
+        # that there is not nec a round function for each dimension here.
+        for param_name, round_f in self.round_to_values.items():
+            for xx in next_guess:
+                xx[param_name] = round_f(xx[param_name])
+        return next_guess
+
+    def observe(self, X, y):
+        """Send an observation of a suggestion back to the optimizer.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated
+        """
+        # Supposedly skopt can handle blocks, but not sure about interface for
+        # that. Just do loop to be safe for now.
+        for xx, yy in zip(X, y):
+            # skopt needs lists instead of dicts
+            xx = [xx[dim_name] for dim_name in self.dimensions_list]
+            # Just ignore, any inf observations we got, unclear if right thing
+            if np.isfinite(yy):
+                self.skopt.tell(xx, yy)
+
+
+if __name__ == "__main__":
+    experiment_main(ScikitOptimizer)
+
+File Path: example_submissions/turbo/optimizer.py
+Content:
+from copy import deepcopy
+
+import numpy as np
+import scipy.stats as ss
+from turbo import Turbo1
+from turbo.utils import from_unit_cube, latin_hypercube, to_unit_cube
+
+from bayesmark.abstract_optimizer import AbstractOptimizer
+from bayesmark.experiment import experiment_main
+from bayesmark.space import JointSpace
+
+
+def order_stats(X):
+    _, idx, cnt = np.unique(X, return_inverse=True, return_counts=True)
+    obs = np.cumsum(cnt)  # Need to do it this way due to ties
+    o_stats = obs[idx]
+    return o_stats
+
+
+def copula_standardize(X):
+    X = np.nan_to_num(np.asarray(X))  # Replace inf by something large
+    assert X.ndim == 1 and np.all(np.isfinite(X))
+    o_stats = order_stats(X)
+    quantile = np.true_divide(o_stats, len(X) + 1)
+    X_ss = ss.norm.ppf(quantile)
+    return X_ss
+
+
+class TurboOptimizer(AbstractOptimizer):
+    primary_import = "Turbo"
+
+    def __init__(self, api_config, **kwargs):
+        """Build wrapper class to use an optimizer in benchmark.
+
+        Parameters
+        ----------
+        api_config : dict-like of dict-like
+            Configuration of the optimization variables. See API description.
+        """
+        AbstractOptimizer.__init__(self, api_config)
+
+        self.space_x = JointSpace(api_config)
+        self.bounds = self.space_x.get_bounds()
+        self.lb, self.ub = self.bounds[:, 0], self.bounds[:, 1]
+        self.dim = len(self.bounds)
+        self.max_evals = np.iinfo(np.int32).max  # NOTE: Largest possible int
+        self.batch_size = None
+        self.history = []
+
+        self.turbo = Turbo1(
+            f=None,
+            lb=self.bounds[:, 0],
+            ub=self.bounds[:, 1],
+            n_init=2 * self.dim + 1,
+            max_evals=self.max_evals,
+            batch_size=1,  # We need to update this later
+            verbose=False,
+        )
+
+    def restart(self):
+        self.turbo._restart()
+        self.turbo._X = np.zeros((0, self.turbo.dim))
+        self.turbo._fX = np.zeros((0, 1))
+        X_init = latin_hypercube(self.turbo.n_init, self.dim)
+        self.X_init = from_unit_cube(X_init, self.lb, self.ub)
+
+    def suggest(self, n_suggestions=1):
+        if self.batch_size is None:  # Remember the batch size on the first call to suggest
+            self.batch_size = n_suggestions
+            self.turbo.batch_size = n_suggestions
+            self.turbo.failtol = np.ceil(np.max([4.0 / self.batch_size, self.dim / self.batch_size]))
+            self.turbo.n_init = max([self.turbo.n_init, self.batch_size])
+            self.restart()
+
+        X_next = np.zeros((n_suggestions, self.dim))
+
+        # Pick from the initial points
+        n_init = min(len(self.X_init), n_suggestions)
+        if n_init > 0:
+            X_next[:n_init] = deepcopy(self.X_init[:n_init, :])
+            self.X_init = self.X_init[n_init:, :]  # Remove these pending points
+
+        # Get remaining points from TuRBO
+        n_adapt = n_suggestions - n_init
+        if n_adapt > 0:
+            if len(self.turbo._X) > 0:  # Use random points if we can't fit a GP
+                X = to_unit_cube(deepcopy(self.turbo._X), self.lb, self.ub)
+                fX = copula_standardize(deepcopy(self.turbo._fX).ravel())  # Use Copula
+                X_cand, y_cand, _ = self.turbo._create_candidates(
+                    X, fX, length=self.turbo.length, n_training_steps=100, hypers={}
+                )
+                X_next[-n_adapt:, :] = self.turbo._select_candidates(X_cand, y_cand)[:n_adapt, :]
+                X_next[-n_adapt:, :] = from_unit_cube(X_next[-n_adapt:, :], self.lb, self.ub)
+
+        # Unwarp the suggestions
+        suggestions = self.space_x.unwarp(X_next)
+        return suggestions
+
+    def observe(self, X, y):
+        """Send an observation of a suggestion back to the optimizer.
+
+        Parameters
+        ----------
+        X : list of dict-like
+            Places where the objective function has already been evaluated.
+            Each suggestion is a dictionary where each key corresponds to a
+            parameter being optimized.
+        y : array-like, shape (n,)
+            Corresponding values where objective has been evaluated
+        """
+        assert len(X) == len(y)
+        XX, yy = self.space_x.warp(X), np.array(y)[:, None]
+
+        if len(self.turbo._fX) >= self.turbo.n_init:
+            self.turbo._adjust_length(yy)
+
+        self.turbo.n_evals += self.batch_size
+
+        self.turbo._X = np.vstack((self.turbo._X, deepcopy(XX)))
+        self.turbo._fX = np.vstack((self.turbo._fX, deepcopy(yy)))
+        self.turbo.X = np.vstack((self.turbo.X, deepcopy(XX)))
+        self.turbo.fX = np.vstack((self.turbo.fX, deepcopy(yy)))
+
+        # Check for a restart
+        if self.turbo.length < self.turbo.length_min:
+            self.restart()
+
+
+if __name__ == "__main__":
+    experiment_main(TurboOptimizer)
+
+Output:
+{
+    "experimental_code": "import numpy as np\\nfrom scipy.interpolate import interp1d\\nfrom skopt import Optimizer as SkOpt\\nfrom skopt.space import Categorical, Integer, Real\\n\\nfrom bayesmark.abstract_optimizer import AbstractOptimizer\\nfrom bayesmark.experiment import experiment_main\\n\\n\\nclass ScikitOptimizer(AbstractOptimizer):\\n    primary_import = \"scikit-optimize\"\\n\\n    def __init__(self, api_config, base_estimator=\"GBRT\", acq_func=\"EI\", n_initial_points=5):\\n        \"\"\"Build wrapper class to use an optimizer in benchmark.\\n\\n        Parameters\\n        ----------\\n        api_config : dict-like of dict-like\\n            Configuration of the optimization variables. See API description.\\n        base_estimator : {'GP', 'RF', 'ET', 'GBRT'}\\n            How to estimate the objective function.\\n        acq_func : {'LCB', 'EI', 'PI', 'gp_hedge', 'EIps', 'PIps'}\\n            Acquisition objective to decide next suggestion.\\n        n_initial_points : int\\n            Number of points to sample randomly before actual Bayes opt.\\n        \"\"\"\\n        AbstractOptimizer.__init__(self, api_config)\\n\\n        dimensions, self.round_to_values = ScikitOptimizer.get_sk_dimensions(api_config)\\n\\n        # Older versions of skopt don't copy over the dimensions names during\\n        # normalization and hence the names are missing in\\n        # self.skopt.space.dimensions. Therefore, we save our own copy of\\n        # dimensions list to be safe. If we can commit to using the newer\\n        # versions of skopt we can delete self.dimensions.\\n        self.dimensions_list = tuple(dd.name for dd in dimensions)\\n\\n        self.skopt = SkOpt(\\n            dimensions,\\n            n_initial_points=n_initial_points,\\n            base_estimator=base_estimator,\\n            acq_func=acq_func,\\n            acq_optimizer=\"sampling\",\\n            acq_func_kwargs={},\\n            acq_optimizer_kwargs={},\\n        )\\n\\n    @staticmethod\\n    def get_sk_dimensions(api_config, transform=\"normalize\"):\\n        \"\"\"Help routine to setup skopt search space in constructor.\\n\\n        Take api_config as argument so this can be static.\\n        \"\"\"\\n        # The ordering of iteration prob makes no difference, but just to be\\n        # safe and consistnent with space.py, I will make sorted.\\n        param_list = sorted(api_config.keys())\\n\\n        sk_dims = []\\n        round_to_values = {}\\n        for param_name in param_list:\\n            param_config = api_config[param_name]\\n\\n            param_type = param_config[\"type\"]\\n\\n            param_space = param_config.get(\"space\", None)\\n            param_range = param_config.get(\"range\", None)\\n            param_values = param_config.get(\"values\", None)\\n\\n            # Some setup for case that whitelist of values is provided:\\n            values_only_type = param_type in (\"cat\", \"ordinal\")\\n            if (param_values is not None) and (not values_only_type):\\n                assert param_range is None\\n                param_values = np.unique(param_values)\\n                param_range = (param_values[0], param_values[-1])\\n                round_to_values[param_name] = interp1d(\\n                    param_values, param_values, kind=\"nearest\", fill_value=\"extrapolate\"\\n                )\\n\\n            if param_type == \"int\":\\n                # Integer space in sklearn does not support any warping => Need\\n                # to leave the warping as linear in skopt.\\n                sk_dims.append(Integer(param_range[0], param_range[-1], transform=transform, name=param_name))\\n            elif param_type == \"bool\":\\n                assert param_range is None\\n                assert param_values is None\\n                sk_dims.append(Integer(0, 1, transform=transform, name=param_name))\\n            elif param_type in (\"cat\", \"ordinal\"):\\n                assert param_range is None\\n                # Leave x-form to one-hot as per skopt default\\n                sk_dims.append(Categorical(param_values, name=param_name))\\n            elif param_type == \"real\":\\n                # Skopt doesn't support all our warpings, so need to pick\\n                # closest substitute it does support.\\n                prior = \"log-uniform\" if param_space in (\"log\", \"logit\") else \"uniform\"\\n                sk_dims.append(Real(param_range[0], param_range[-1], prior=prior, transform=transform, name=param_name))\\n            else:\\n                assert False, \"type %s not handled in API\" % param_type\\n        return sk_dims, round_to_values\\n\\n    def suggest(self, n_suggestions=1):\\n        \"\"\"Get a suggestion from the optimizer.\\n\\n        Parameters\\n        ----------\\n        n_suggestions : int\\n            Desired number of parallel suggestions in the output\\n\\n        Returns\\n        -------\\n        next_guess : list of dict\\n            List of `n_suggestions` suggestions to evaluate the objective\\n            function. Each suggestion is a dictionary where each key\\n            corresponds to a parameter being optimized.\\n        \"\"\"\\n        # First get list of lists from skopt.ask()\\n        next_guess = self.skopt.ask(n_points=n_suggestions)\\n        # Then convert to list of dicts\\n        next_guess = [dict(zip(self.dimensions_list, x)) for x in next_guess]\\n\\n        # Now do the rounding, custom rounding is not supported in skopt. Note\\n        # that there is not nec a round function for each dimension here.\\n        for param_name, round_f in self.round_to_values.items():\\n            for xx in next_guess:\\n                xx[param_name] = round_f(xx[param_name])\\n        return next_guess\\n\\n    def observe(self, X, y):\\n        \"\"\"Send an observation of a suggestion back to the optimizer.\\n\\n        Parameters\\n        ----------\\n        X : list of dict-like\\n            Places where the objective function has already been evaluated.\\n            Each suggestion is a dictionary where each key corresponds to a\\n            parameter being optimized.\\n        y : array-like, shape (n,)\\n            Corresponding values where objective has been evaluated\\n        \"\"\"\\n        # Supposedly skopt can handle blocks, but not sure about interface for\\n        # that. Just do loop to be safe for now.\\n        for xx, yy in zip(X, y):\\n            # skopt needs lists instead of dicts\\n            xx = [xx[dim_name] for dim_name in self.dimensions_list]\\n            # Just ignore, any inf observations we got, unclear if right thing\\n            if np.isfinite(yy):\\n                self.skopt.tell(xx, yy)\\n\\n\\nif __name__ == \"__main__\":\\n    experiment_main(ScikitOptimizer)",
+    "experimental_info": "This code (`skopt/optimizer.py`) implements a Bayesian Optimization (BO) optimizer using the `scikit-optimize` library. This can serve as the 'local HPO' component for individual parties in the FLoRA framework, which, according to the method description, each party would independently perform to generate (hyper-parameter, local loss) pairs. The experimental settings for this local optimizer are configurable via its constructor parameters: `base_estimator` (default: 'GBRT', options: 'GP', 'RF', 'ET' for surrogate model), `acq_func` (default: 'EI', options: 'LCB', 'PI', 'gp_hedge', 'EIps', 'PIps' for acquisition function), and `n_initial_points` (default: 5, number of random samples before BO starts). It is important to note that the aggregation and meta-learning aspects of FLoRA (e.g., central aggregator, unified loss surface construction methods like SGM, SGM+U, MPLM, or APLM) are not present in this optimizer's code. This file exclusively represents a single, independent local optimization strategy, which is only one part of the overall FLoRA architecture."
+}
